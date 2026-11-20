@@ -1,0 +1,9 @@
+build/
+out/
+.vs/
+.vscode/
+*.user
+*.spv
+*.bmp
+buildlog.txt
+CMakeUserPresets.json
