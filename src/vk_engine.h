@@ -35,6 +35,9 @@ struct SkyState {
     float cloudBase = 900.0f;
     float cloudTop = 1800.0f;
 
+    int blockers=0;
+    vec4 lo[8]{}, hi[8]{};
+
     // flashlight + lightning flash
     vec3 lightDir{0, 0, -1};
     float flashlight = 0.0f;
@@ -56,6 +59,8 @@ public:
     void requestScreenshot(const char* path);
 
     // VRAM numbers from VK_EXT_memory_budget (0 when unsupported).
+    bool profile = false; // enable before init; zero timestamp overhead otherwise
+    float gpuMs = 0;
     float vramUsedMB = 0.0f;
     float vramBudgetMB = 0.0f;
 

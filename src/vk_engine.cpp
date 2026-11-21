@@ -1,10 +1,14 @@
+#ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include "vk_engine.h"
 #include "cloudtex.h"
 
 #include <vulkan/vulkan.h>
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <cstdio>
 #include <cstddef>
@@ -31,7 +35,7 @@
 namespace {
 
 constexpr int MAX_FRAMES = 2;
-constexpr int MAX_SWAP_IMAGES = 8;
+
 constexpr int CLOUD_TEX_SIZE = 1024;
 
 struct UBO {
@@ -43,9 +47,10 @@ struct UBO {
     vec4 env;         // x storm, y wetness, z rain, w cloud base
     vec4 screen;      // xy resolution, zw 1/resolution
     vec4 lightDir;    // xyz flashlight direction, w range
+    vec4 lo[8], hi[8];
 };
-static_assert(sizeof(UBO) == 224, "UBO layout must match the shaders");
-constexpr VkDeviceSize UBO_STRIDE = 256;
+static_assert(sizeof(UBO) == 480, "UBO layout must match the shaders");
+constexpr VkDeviceSize UBO_STRIDE = 512;
 
 uint32_t findMemoryType(VkPhysicalDeviceMemoryProperties& mp, uint32_t mask, VkMemoryPropertyFlags flags) {
     for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
@@ -85,7 +90,7 @@ void writeBmp(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
     std::memcpy(header + 34, &dataSize, 4);
 
     FILE* f = std::fopen(path, "wb");
-    if (!f) return;
+    if (!f) { std::perror(path); std::exit(1); }
     std::fwrite(header, 1, 54, f);
     std::vector<uint8_t> row(rowSize, 0);
     for (int y = (int)h - 1; y >= 0; --y) {
@@ -97,7 +102,7 @@ void writeBmp(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
         }
         std::fwrite(row.data(), 1, rowSize, f);
     }
-    std::fclose(f);
+    if (std::ferror(f) || std::fclose(f)) { std::perror(path); std::exit(1); }
 }
 
 void cmdTransition(VkCommandBuffer cmd, VkImage img, VkImageLayout from, VkImageLayout to,
@@ -122,8 +127,10 @@ void cmdTransition(VkCommandBuffer cmd, VkImage img, VkImageLayout from, VkImage
 } // namespace
 
 struct Renderer::Impl {
+#ifdef _WIN32
     HWND hwnd = nullptr;
     HINSTANCE hinst = nullptr;
+#endif
     std::string shaderDir;
 
     VkInstance instance = VK_NULL_HANDLE;
@@ -131,6 +138,8 @@ struct Renderer::Impl {
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkPhysicalDevice gpu = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE;
+    VkQueryPool timestamps=VK_NULL_HANDLE;
+    float nsPerTick=0; uint32_t timeBits=0; bool timed[MAX_FRAMES]{};
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t qFamily = 0;
     VkPhysicalDeviceMemoryProperties memProps{};
@@ -149,7 +158,9 @@ struct Renderer::Impl {
     VkCommandPool cmdPool = VK_NULL_HANDLE;
     VkCommandBuffer cmds[MAX_FRAMES]{};
     VkSemaphore imgAvailable[MAX_FRAMES]{};
-    VkSemaphore renderDone[MAX_SWAP_IMAGES]{};
+    std::vector<VkSemaphore> renderDone;
+    bool dirty = false, canCapture = false;
+    uint32_t drops = 0, statsCounter = 0;
     VkFence fences[MAX_FRAMES]{};
 
     VkBuffer ubo = VK_NULL_HANDLE;
@@ -253,8 +264,10 @@ void Renderer::Impl::immediateSubmit(void (*fn)(VkCommandBuffer, void*), void* u
 
 bool Renderer::init(void* hwnd_, int w, int h, const char* shaderDir_, float sunAzimuth) {
     m = new Impl();
+#ifdef _WIN32
     m->hwnd = (HWND)hwnd_;
     m->hinst = GetModuleHandleW(nullptr);
+#endif
     m->shaderDir = shaderDir_;
     m->width = w;
     m->height = h;
@@ -266,7 +279,13 @@ bool Renderer::init(void* hwnd_, int w, int h, const char* shaderDir_, float sun
     app.engineVersion = 1;
     app.apiVersion = VK_API_VERSION_1_3;
 
-    std::vector<const char*> instExt{VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    std::vector<const char*> instExt{VK_KHR_SURFACE_EXTENSION_NAME,
+#ifdef _WIN32
+        VK_KHR_WIN32_SURFACE_EXTENSION_NAME
+#else
+        VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME
+#endif
+    };
 #if ENABLE_VALIDATION
     instExt.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 #endif
@@ -295,11 +314,17 @@ bool Renderer::init(void* hwnd_, int w, int h, const char* shaderDir_, float sun
     if (createFn) createFn(m->instance, &dci, nullptr, &m->debug);
 #endif
 
+#ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR sci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     sci.hinstance = m->hinst;
     sci.hwnd = m->hwnd;
     VK_CHECK(vkCreateWin32SurfaceKHR(m->instance, &sci, nullptr, &m->surface));
 
+#else
+    VkHeadlessSurfaceCreateInfoEXT sci{VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT};
+    auto create = (PFN_vkCreateHeadlessSurfaceEXT)vkGetInstanceProcAddr(m->instance,"vkCreateHeadlessSurfaceEXT");
+    if (!create || create(m->instance,&sci,nullptr,&m->surface) != VK_SUCCESS) return false;
+#endif
     uint32_t count = 0;
     vkEnumeratePhysicalDevices(m->instance, &count, nullptr);
     std::vector<VkPhysicalDevice> gpus(count);
@@ -308,6 +333,18 @@ bool Renderer::init(void* hwnd_, int w, int h, const char* shaderDir_, float sun
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(g, &props);
         if (props.apiVersion < VK_API_VERSION_1_3) continue;
+        VkPhysicalDeviceVulkan13Features features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        supported.pNext = &features;
+        vkGetPhysicalDeviceFeatures2(g,&supported);
+        if (!features.dynamicRendering) continue;
+        uint32_t extCount=0;
+        vkEnumerateDeviceExtensionProperties(g,nullptr,&extCount,nullptr);
+        std::vector<VkExtensionProperties> available(extCount);
+        vkEnumerateDeviceExtensionProperties(g,nullptr,&extCount,available.data());
+        bool hasSwapchain=false;
+        for(const auto& e:available) hasSwapchain |= !std::strcmp(e.extensionName,VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        if(!hasSwapchain) continue;
         uint32_t qc = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(g, &qc, nullptr);
         std::vector<VkQueueFamilyProperties> qs(qc);
@@ -316,6 +353,7 @@ bool Renderer::init(void* hwnd_, int w, int h, const char* shaderDir_, float sun
             VkBool32 present = VK_FALSE;
             vkGetPhysicalDeviceSurfaceSupportKHR(g, i, m->surface, &present);
             if ((qs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) {
+                m->nsPerTick=props.limits.timestampPeriod; m->timeBits=qs[i].timestampValidBits;
                 m->gpu = g;
                 m->qFamily = i;
                 std::printf("[vk] GPU: %s\n", props.deviceName);
@@ -338,7 +376,7 @@ bool Renderer::init(void* hwnd_, int w, int h, const char* shaderDir_, float sun
 
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.dynamicRendering = VK_TRUE;
-    f13.shaderDemoteToHelperInvocation = VK_TRUE;
+
 
     const char* devExt[2] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, nullptr};
     uint32_t devExtCount = 1;
@@ -362,6 +400,11 @@ bool Renderer::init(void* hwnd_, int w, int h, const char* shaderDir_, float sun
     dci2.enabledExtensionCount = devExtCount;
     dci2.ppEnabledExtensionNames = devExt;
     VK_CHECK(vkCreateDevice(m->gpu, &dci2, nullptr, &m->dev));
+    if (profile && m->timeBits) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType=VK_QUERY_TYPE_TIMESTAMP; qi.queryCount=2*MAX_FRAMES;
+        VK_CHECK(vkCreateQueryPool(m->dev,&qi,nullptr,&m->timestamps));
+    }
     vkGetDeviceQueue(m->dev, m->qFamily, 0, &m->queue);
 
     m->createSwapchain();
@@ -385,6 +428,7 @@ bool Renderer::init(void* hwnd_, int w, int h, const char* shaderDir_, float sun
         VK_CHECK(vkCreateSemaphore(m->dev, &semci, nullptr, &m->imgAvailable[i]));
         VK_CHECK(vkCreateFence(m->dev, &fci, nullptr, &m->fences[i]));
     }
+    m->renderDone.resize(m->images.size());
     for (size_t i = 0; i < m->images.size(); ++i)
         VK_CHECK(vkCreateSemaphore(m->dev, &semci, nullptr, &m->renderDone[i]));
 
@@ -461,6 +505,9 @@ void Renderer::Impl::createSwapchain() {
     sci.imageExtent = extent;
     sci.imageArrayLayers = 1;
     sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    canCapture = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
+                 (colorFormat == VK_FORMAT_B8G8R8A8_SRGB || colorFormat == VK_FORMAT_B8G8R8A8_UNORM);
+    if (canCapture) sci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sci.preTransform = caps.currentTransform;
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -802,7 +849,7 @@ void Renderer::Impl::createPipelines() {
 
     skyPipe = make({"sky.vert.spv", "sky.frag.spv", false, true, false, false, false});
     meshPipe = make({"mesh.vert.spv", "mesh.frag.spv", true, true, true, true, false});
-    rainPipe = make({"rain.vert.spv", "rain.frag.spv", false, true, false, false, true});
+    rainPipe = make({"rain.vert.spv", "rain.frag.spv", false, true, true, false, true});
 }
 
 void Renderer::Impl::updateMemoryStats() {
@@ -826,10 +873,10 @@ void Renderer::Impl::updateMemoryStats() {
 bool Renderer::beginFrame(int w, int h, const CameraState& cam, const SkyState& sky) {
     if (w <= 0 || h <= 0) return false;
 
-    bool needRecreate = (m->swapchain == VK_NULL_HANDLE) || (uint32_t)w != m->extent.width ||
-                        (uint32_t)h != m->extent.height;
+    bool needRecreate = m->dirty || (m->swapchain == VK_NULL_HANDLE) || w != m->width || h != m->height;
     if (needRecreate) {
         vkDeviceWaitIdle(m->dev);
+        m->dirty = false;
         m->destroySwapchain();
         if (m->depthView) vkDestroyImageView(m->dev, m->depthView, nullptr);
         if (m->depth) vkDestroyImage(m->dev, m->depth, nullptr);
@@ -839,10 +886,16 @@ bool Renderer::beginFrame(int w, int h, const CameraState& cam, const SkyState& 
         m->depthMem = VK_NULL_HANDLE;
         m->width = w;
         m->height = h;
+        VkFormat oldFormat=m->colorFormat;
         m->createSwapchain();
+        if(m->colorFormat!=oldFormat){
+            vkDestroyPipeline(m->dev,m->skyPipe,nullptr); vkDestroyPipeline(m->dev,m->meshPipe,nullptr);
+            vkDestroyPipeline(m->dev,m->rainPipe,nullptr); m->createPipelines();
+        }
         m->createDepth();
+        if (m->renderDone.size() < m->images.size()) m->renderDone.resize(m->images.size());
         for (size_t i = 0; i < m->images.size(); ++i) {
-            if (i < MAX_SWAP_IMAGES && m->renderDone[i] == VK_NULL_HANDLE) {
+            if (m->renderDone[i] == VK_NULL_HANDLE) {
                 VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
                 VK_CHECK(vkCreateSemaphore(m->dev, &sci, nullptr, &m->renderDone[i]));
             }
@@ -851,9 +904,16 @@ bool Renderer::beginFrame(int w, int h, const CameraState& cam, const SkyState& 
 
     VK_CHECK(vkWaitForFences(m->dev, 1, &m->fences[m->frame], VK_TRUE, UINT64_MAX));
 
+    if(m->timestamps && m->timed[m->frame]) {
+        uint64_t t[2];
+        VK_CHECK(vkGetQueryPoolResults(m->dev,m->timestamps,m->frame*2,2,sizeof(t),t,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT));
+        uint64_t mask=UINT64_MAX>>(64-m->timeBits);
+        gpuMs=float((t[1]-t[0])&mask)*m->nsPerTick*1.e-6f;
+    }
     VkResult acq = vkAcquireNextImageKHR(m->dev, m->swapchain, UINT64_MAX,
                                          m->imgAvailable[m->frame], VK_NULL_HANDLE, &m->imageIndex);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) return false;
+    if (acq == VK_ERROR_OUT_OF_DATE_KHR) { m->dirty = true; return false; }
+    m->dirty = acq == VK_SUBOPTIMAL_KHR;
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) VK_CHECK(acq);
 
     VK_CHECK(vkResetFences(m->dev, 1, &m->fences[m->frame]));
@@ -871,10 +931,12 @@ bool Renderer::beginFrame(int w, int h, const CameraState& cam, const SkyState& 
     u.camPosTime = vec4(cam.pos, sky.time);
     u.sunDirCov = vec4(normalize(sky.sunDir), sky.coverage);
     u.params = vec4(sky.exposure, cam.pos.y, sky.flash, sky.flashlight);
+    m->drops = uint32_t(4800 * clampf(sky.rain,0,1));
     u.env = vec4(sky.storm, sky.wetness, sky.rain, sky.cloudBase);
     u.screen = vec4((float)m->extent.width, (float)m->extent.height,
                     1.0f / (float)m->extent.width, 1.0f / (float)m->extent.height);
-    u.lightDir = vec4(sky.lightDir, 30.0f);
+    u.lightDir = vec4(sky.lightDir, float(sky.blockers));
+    std::memcpy(u.lo,sky.lo,sizeof(u.lo)); std::memcpy(u.hi,sky.hi,sizeof(u.hi));
     std::memcpy((uint8_t*)m->uboMapped + m->frame * UBO_STRIDE, &u, sizeof(UBO));
 
     VkCommandBuffer cmd = m->cmds[m->frame];
@@ -882,13 +944,16 @@ bool Renderer::beginFrame(int w, int h, const CameraState& cam, const SkyState& 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+    if(m->timestamps){ vkCmdResetQueryPool(cmd,m->timestamps,m->frame*2,2);
+        vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,m->timestamps,m->frame*2); }
 
     cmdTransition(cmd, m->images[m->imageIndex], VK_IMAGE_LAYOUT_UNDEFINED,
                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, false);
     cmdTransition(cmd, m->depth, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                  0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, true);
+                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, true);
 
     VkRenderingAttachmentInfo colorAtt{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     colorAtt.imageView = m->views[m->imageIndex];
@@ -979,13 +1044,17 @@ void Renderer::endFrame() {
     m->inFrame = false;
     VkCommandBuffer cmd = m->cmds[m->frame];
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m->rainPipe);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m->pipeLayout, 0, 1,
-                            &m->sets[m->frame], 0, nullptr);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
+    if (m->drops) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m->rainPipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m->pipeLayout, 0, 1,
+                                &m->sets[m->frame], 0, nullptr);
+        vkCmdDraw(cmd, 6, m->drops, 0, 0);
+    }
 
     vkCmdEndRendering(cmd);
 
+    if(m->timestamps){ vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,m->timestamps,m->frame*2+1);
+        m->timed[m->frame]=true; }
     bool wantShot = m->shotPending;
     if (wantShot) {
         VkDeviceSize need = (VkDeviceSize)m->extent.width * m->extent.height * 4;
@@ -1047,7 +1116,8 @@ void Renderer::endFrame() {
     pi.pSwapchains = &m->swapchain;
     pi.pImageIndices = &m->imageIndex;
     VkResult r = vkQueuePresentKHR(m->queue, &pi);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vkDeviceWaitIdle(m->dev);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) m->dirty = true;
+    else VK_CHECK(r);
 
     if (wantShot) {
         VK_CHECK(vkWaitForFences(m->dev, 1, &m->fences[m->frame], VK_TRUE, UINT64_MAX));
@@ -1061,7 +1131,7 @@ void Renderer::endFrame() {
 
     m->frame = (m->frame + 1) % MAX_FRAMES;
 
-    if ((m->frame & 31u) == 0) {
+    if ((++m->statsCounter & 31u) == 0) {
         m->updateMemoryStats();
         vramUsedMB = m->memUsedMB;
         vramBudgetMB = m->memBudgetMB;
@@ -1070,6 +1140,7 @@ void Renderer::endFrame() {
 
 void Renderer::requestScreenshot(const char* path) {
     if (!m) return;
+    if (!m->canCapture) { std::fprintf(stderr,"Surface does not support BGRA capture\n"); std::exit(1); }
     m->shotPath = path;
     m->shotPending = true;
 }
@@ -1110,6 +1181,7 @@ void Renderer::shutdown() {
     if (m->depth) vkDestroyImage(m->dev, m->depth, nullptr);
     if (m->depthMem) vkFreeMemory(m->dev, m->depthMem, nullptr);
     m->destroySwapchain();
+    if(m->timestamps) vkDestroyQueryPool(m->dev,m->timestamps,nullptr);
     if (m->cmdPool) vkDestroyCommandPool(m->dev, m->cmdPool, nullptr);
     if (m->dev) vkDestroyDevice(m->dev, nullptr);
     if (m->surface) vkDestroySurfaceKHR(m->instance, m->surface, nullptr);

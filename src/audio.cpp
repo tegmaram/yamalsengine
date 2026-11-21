@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <xaudio2.h>
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 #include <cstdint>
@@ -16,6 +17,10 @@ struct Impl {
     IXAudio2MasteringVoice* master = nullptr;
     IXAudio2SourceVoice* thunderVoice = nullptr;
     std::vector<int16_t> thunderBuf;
+    IXAudio2SourceVoice *rain=nullptr, *relay=nullptr;
+    std::vector<int16_t> bed, ping;
+    float prevRain=-1, prevRelay=-1, prevPan=-2;
+    bool com=false;
     WAVEFORMATEX fmt{};
 };
 
@@ -57,15 +62,16 @@ void genThunder(std::vector<int16_t>& buf) {
 } // namespace
 
 bool Audio::init() {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-
     auto* im = new Impl();
+    im->com=SUCCEEDED(CoInitializeEx(nullptr,COINIT_MULTITHREADED));
     if (FAILED(XAudio2Create(&im->engine, 0, XAUDIO2_DEFAULT_PROCESSOR))) {
+        if(im->com) CoUninitialize();
         delete im;
         return false;
     }
     if (FAILED(im->engine->CreateMasteringVoice(&im->master))) {
         im->engine->Release();
+        if(im->com) CoUninitialize();
         delete im;
         return false;
     }
@@ -81,11 +87,29 @@ bool Audio::init() {
     genThunder(im->thunderBuf);
 
     if (FAILED(im->engine->CreateSourceVoice(&im->thunderVoice, &im->fmt))) {
+        im->master->DestroyVoice();
         im->engine->Release();
+        if(im->com) CoUninitialize();
         delete im;
         return false;
     }
 
+    // One second of looped PCM per layer. Stereo relay permits cheap per-channel panning.
+    auto loop=[&](IXAudio2SourceVoice*& voice,std::vector<int16_t>& pcm,bool stereo) {
+        WAVEFORMATEX fmt=im->fmt; fmt.nChannels=stereo?2:1;
+        fmt.nBlockAlign=fmt.nChannels*2; fmt.nAvgBytesPerSec=SR*fmt.nBlockAlign;
+        if(FAILED(im->engine->CreateSourceVoice(&voice,&fmt))) return;
+        pcm.resize(SR*fmt.nChannels);
+        float filtered=0;
+        for(int i=0;i<SR;++i){
+            float t=float(i)/SR; filtered=.6f*filtered+.4f*(2*rnd()-1);
+            float sample=stereo ? std::sin(t*6.283185f*580)*std::exp(-t*12)*std::min(1.f,t*80) : filtered;
+            for(int c=0;c<fmt.nChannels;++c) pcm[i*fmt.nChannels+c]=int16_t(sample*10000);
+        }
+        XAUDIO2_BUFFER b{}; b.AudioBytes=UINT32(pcm.size()*2); b.pAudioData=(const BYTE*)pcm.data();
+        b.LoopCount=XAUDIO2_LOOP_INFINITE; voice->SetVolume(0); voice->SubmitSourceBuffer(&b); voice->Start();
+    };
+    loop(im->rain,im->bed,false); loop(im->relay,im->ping,true);
     g = im;
     return true;
 }
@@ -96,8 +120,11 @@ void Audio::shutdown() {
         g->thunderVoice->Stop(0);
         g->thunderVoice->DestroyVoice();
     }
+    if (g->rain) g->rain->DestroyVoice();
+    if (g->relay) g->relay->DestroyVoice();
     if (g->master) g->master->DestroyVoice();
     if (g->engine) g->engine->Release();
+    if(g->com) CoUninitialize();
     delete g;
     g = nullptr;
 }
@@ -120,3 +147,11 @@ void Audio::playThunder(float v) {
 }
 
 bool Audio::ok() const { return g != nullptr; }
+
+void Audio::ambience(float rain,float relay,float pan) {
+    if(!g) return;
+    if(g->rain && std::abs(rain-g->prevRain)>.001f){g->rain->SetVolume(rain*.45f); g->prevRain=rain;}
+    if(g->relay && (std::abs(pan-g->prevPan)>.01f || std::abs(relay-g->prevRelay)>.001f)){
+        g->prevPan=pan; g->prevRelay=relay; float channels[2]={.55f-.45f*pan,.55f+.45f*pan};
+        g->relay->SetChannelVolumes(2,channels); g->relay->SetVolume(relay); }
+}

@@ -7,3 +7,4 @@ out/
 *.bmp
 buildlog.txt
 CMakeUserPresets.json
+!shaders/compiled/*.spv
