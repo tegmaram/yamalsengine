@@ -5,7 +5,7 @@
 
 namespace {
 Platform* g_platform = nullptr;
-double g_start = 0.0;
+LARGE_INTEGER g_start{}, g_freq{};
 bool g_recenter = false;
 } // namespace
 
@@ -17,8 +17,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (p) p->quit = true;
             return 0;
         case WM_SIZE:
-            if (p && wParam != SIZE_MINIMIZED) {
-                p->width = LOWORD(lParam);
+            if (p) {
+                p->width = wParam==SIZE_MINIMIZED ? 0 : LOWORD(lParam);
                 p->height = HIWORD(lParam);
             }
             return 0;
@@ -46,7 +46,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (!p) return 0;
             UINT size = 0;
             GetRawInputData((HRAWINPUT)lParam, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER));
-            if (size == 0 || size > 128) return 0;
+            if (size == 0 || size > sizeof(RAWINPUT)) return 0;
             RAWINPUT raw{};
             if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) != size)
                 return 0;
@@ -101,7 +101,8 @@ bool platformInit(Platform& p, const wchar_t* title, int width, int height) {
     rid.hwndTarget = hwnd;
     RegisterRawInputDevices(&rid, 1, sizeof(rid));
 
-    QueryPerformanceCounter((LARGE_INTEGER*)&g_start);
+    QueryPerformanceCounter(&g_start);
+    QueryPerformanceFrequency(&g_freq);
     return true;
 }
 
@@ -157,8 +158,7 @@ void platformPoll(Platform& p) {
 }
 
 double platformTime() {
-    LARGE_INTEGER now, freq;
+    LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    QueryPerformanceFrequency(&freq);
-    return double(now.QuadPart - (LONGLONG)g_start) / double(freq.QuadPart);
+    return double(now.QuadPart - g_start.QuadPart) / double(g_freq.QuadPart);
 }

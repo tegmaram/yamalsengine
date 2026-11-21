@@ -16,6 +16,7 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 env;     // x storm, y wetness, z rain, w cloud base
     vec4 screen;
     vec4 lightDir; // xyz flashlight direction, w range
+    vec4 lo[8], hi[8];
 } ubo;
 
 layout(set = 0, binding = 1) uniform sampler2D cloudTex;
@@ -57,6 +58,21 @@ void main() {
     float upness = smoothstep(0.35, 0.85, n.y);
     float wet = clamp(wetness * upness, 0.0, 1.0);
 
+    // Water fills a fixed depression field first; the shoreline moves as storage changes.
+    float pool = 0.;
+    if (wet > .14 && abs(vWorld.y) < .02) {
+        vec2 q = vWorld.xz;
+        float basin = .52 + .19*sin(q.x*1.7 + sin(q.y)) + .17*sin(q.y*2.1-q.x*.8)
+                        + .08*sin(dot(q,vec2(3.3,2.7)));
+        pool = smoothstep(basin,basin+.06,wet*.86);
+        // Local impact rings: one analytic ripple cell, no reflection render target.
+        vec2 cell = q*2.2;
+        float seed = hash12(floor(cell));
+        vec2 r = fract(cell)-.5;
+        float d = length(r), age = fract(t*1.6+seed);
+        float ring = max(0.,1.-abs(d-age*.47)*18.)*(1.-age);
+        n = normalize(n + vec3(r.x,0,r.y)*ring*pool*ubo.env.z*.45);
+    }
     float ndl = max(dot(n, sd), 0.0);
     float shadow = 1.0 - mix(0.82, 0.95, storm) * cloudShadow(vWorld, sd, cov, storm, base);
 
@@ -83,6 +99,16 @@ void main() {
         vec3 Lf = ubo.lightDir.xyz;
         vec3 toFrag = toCam / max(camDist, 1e-3);   // fragment -> eye (points back)
         float spot = smoothstep(0.86, 0.965, dot(-toFrag, Lf)); // eye -> fragment vs beam
+        // Offset the handheld lamp from the eye so nearby boxes cast visible shadows.
+        vec3 right = normalize(cross(Lf,vec3(0,1,0)));
+        vec3 origin = cam + right*.18 - vec3(0,.16,0);
+        vec3 segment = vWorld+n*.012-origin;
+        vec3 inv = mix(vec3(1),vec3(-1),lessThan(segment,vec3(0)))/max(abs(segment),vec3(.00001));
+        if (spot>.001 && camDist<18.) for(int i=0;i<int(ubo.lightDir.w);++i){
+            vec3 a=(ubo.lo[i].xyz-origin)*inv, b=(ubo.hi[i].xyz-origin)*inv;
+            vec3 near=min(a,b), far=max(a,b);
+            if(max(0.,max(near.x,max(near.y,near.z))) < min(.999,min(far.x,min(far.y,far.z)))) {spot=0.; break;}
+        }
         float ndlF = max(dot(n, toFrag), 0.0);      // normal towards the lamp
         float atten = 8.0 / (1.0 + camDist * camDist * 0.30);
         col += albedo * vec3(1.0, 0.96, 0.86) * spot * ndlF * atten * fl;
@@ -101,6 +127,9 @@ void main() {
     col += sunCol * spec * 0.9 * wet;
     float fres = pow(1.0 - max(dot(n, V), 0.0), 5.0);
     col += vec3(0.20, 0.26, 0.36) * fres * wet * 0.35;
+
+    // Cool sky Fresnel with a shallow-water reflection even at non-grazing angles.
+    col = mix(col, col*.54 + ambSky*(.18+1.8*fres) + sunCol*spec*.3, pool);
 
     // fog thickens in the storm
     float dist = length(vWorld - cam);

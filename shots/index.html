@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Rain study · Yamalsengine</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #101716; color: #ecf2ef; font: 1rem/1.5 system-ui, sans-serif; }
+    main { width: min(100%, 880px); }
+    header { color: #9fcbb7; font-size: .8rem; letter-spacing: .13em; }
+    h1 { font-size: clamp(2rem, 5vw, 3rem); margin: .25em 0; }
+    video { width: 100%; aspect-ratio: 16 / 9; display: block; background: #080b0a; border-radius: 8px; }
+    footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: .5rem; margin-top: .8rem; color: #b6c3bd; }
+    a { color: #b5e7ce; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>YAMALSENGINE / ENGINE FOOTAGE</header>
+    <h1>Rain study</h1>
+    <video controls playsinline loop preload="auto" aria-label="Four-second in-game rain and flashlight clip" src="rain.mp4"></video>
+    <footer><span>4 seconds · The flashlight switches on at 0:01.</span><a href="rain.mp4" download>Download MP4</a></footer>
+  </main>
+</body>
+</html>

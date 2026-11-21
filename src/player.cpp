@@ -45,6 +45,11 @@ void Player::look(float dx, float dy) {
 void Player::update(const Platform& in, const std::vector<AABB>& solids, float dt) {
     // --- crouch ---
     bool wantCrouch = in.keys['C'] || in.keys[KEY_CONTROL];
+    if (!wantCrouch && crouch>0) for (const AABB& b:solids) {
+        if (b.mx.y<=pos.y+height()-.01f || b.mn.y>=pos.y+standHeight) continue;
+        float dx=pos.x-clampf(pos.x,b.mn.x,b.mx.x), dz=pos.z-clampf(pos.z,b.mn.z,b.mx.z);
+        if(dx*dx+dz*dz<radius*radius){wantCrouch=true; break;}
+    }
     float target = wantCrouch ? 1.0f : 0.0f;
     crouch += (target - crouch) * (1.0f - std::exp(-14.0f * dt));
     if (crouch < 1e-3f) crouch = 0.0f;
@@ -74,22 +79,22 @@ void Player::update(const Platform& in, const std::vector<AABB>& solids, float d
     // --- integrate + resolve ---
     pos += vel * dt;
 
-    vec3 n{0, 0, 0};
+    bool floorHit=false, ceilingHit=false;
     for (int iter = 0; iter < 4; ++iter) {
         bool any = false;
         for (const AABB& b : solids) {
             vec3 hitN{0, 0, 0};
             if (resolveCapsule(pos, radius, height(), b, hitN)) {
                 any = true;
-                n = hitN;
+                floorHit |= hitN.y>.65f; ceilingHit |= hitN.y<-.65f;
             }
         }
         if (!any) break;
     }
 
-    grounded = n.y > 0.65f;
-    if (n.y > 0.65f && vel.y < 0.0f) vel.y = 0.0f;
-    if (n.y < -0.65f && vel.y > 0.0f) vel.y = 0.0f;
+    grounded = floorHit;
+    if (floorHit && vel.y < 0.0f) vel.y = 0.0f;
+    if (ceilingHit && vel.y > 0.0f) vel.y = 0.0f;
 
     // --- eye height smoothing (separate from capsule to avoid popping) ---
     float eyeTarget = eyeStand + (eyeCrouch - eyeStand) * crouch;

@@ -5,6 +5,7 @@
 #include <algorithm>
 
 MazeResult buildMaze(uint32_t seed, int W, int H, MeshData& mesh, std::vector<AABB>& solids) {
+    if (W<3 || H<3) return {};
     const float cell = 5.0f;
     const float wallH = 7.5f;
     const float halfT = 0.15f; // half wall thickness
@@ -138,5 +139,24 @@ MazeResult buildMaze(uint32_t seed, int W, int H, MeshData& mesh, std::vector<AA
     else if (!Hh(0, 1)) r.spawnYaw = radians(180.0f);
     else r.spawnYaw = radians(0.0f);
 
+    r.passages.resize(W*H);
+    for (int z=0; z<H; ++z) for (int x=0; x<W; ++x)
+        r.passages[z*W+x] = !V(x+1,z) | (!V(x,z)<<1) | (!Hh(x,z+1)<<2) | (!Hh(x,z)<<3);
+    auto traverse = [&](int start) {
+        r.nextRelay.assign(W*H,-1);
+        std::vector<int> queue{start}; r.nextRelay[start]=start;
+        const int offset[4]={1,-1,W,-W};
+        for (size_t i=0; i<queue.size(); ++i) for(int d=0; d<4; ++d) {
+            if (!(r.passages[queue[i]] & (1<<d))) continue;
+            int n=queue[i]+offset[d];
+            if (r.nextRelay[n]>=0) continue;
+            r.nextRelay[n]=queue[i]; queue.push_back(n);
+        }
+        return queue.back();
+    };
+    r.relay=traverse(0); traverse(r.relay);
+    vec3 beacon=r.center(r.relay);
+    addBox(mesh,beacon+vec3(0,.8f,0),{.28f,.8f,.28f},{.85f,.26f,.03f,1});
+    solids.push_back({beacon-vec3(.28f,0,.28f),beacon+vec3(.28f,1.6f,.28f)});
     return r;
 }
